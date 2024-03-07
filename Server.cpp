@@ -11,7 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 
-
+#include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -21,36 +21,10 @@
 
 #include "Server.hh"
 
-namespace mnet_error
-{
-	int error_code = 0;
-	constexpr size_t kBufSize = 64;
-	void perror(const char* note)
-	{
-		char error_info[kBufSize];
-		switch (error_code) 
-		{
-			case 0:
-				strcpy(error_info, "Success");
-				break;
-			case 3: 
-				strcpy(error_info, "Fork error");
-				break;
-			case 1: 
-				strcpy(error_info, "");
-				break;
-			default :
-				break;
-		}
-
-		printf("%s:%s", note, error_info);
-	}
-}
-
-
 #define BUFFER_SIZE 1024
 
 typedef unsigned long long ull;
+typedef std::char_traits<char> ch_traits;
 
 void* Server::SocketWrapperUtils::get_in_addr(struct sockaddr *sa)
 {
@@ -78,7 +52,7 @@ int Server::SocketWrapperUtils::set_nonblock(int socket)
 void mnet_error::perror(const char* note);
 
 Server::User::User(int sockfd, sockaddr_storage user_addr, const socklen_t size_addr, std::string pseudo) :
-	sockfd_(sockfd), size_addr_(size_addr), pseudo_(std::move(pseudo))
+	sockfd_(sockfd), channel_(0), size_addr_(size_addr), pseudo_(std::move(pseudo))
 {
 	// user_addr_ = std::move(user_addr);
 	memmove(&user_addr_, &user_addr, sizeof(sockaddr_in));
@@ -100,6 +74,13 @@ Server::Server() : cliNo_(0), listener_(-1)
 
 int Server::Setup(const char* port)
 {
+	parseFuncs_["/WHO"] = &Server::WhoRequest;
+	parseFuncs_["/HELP"] = &Server::Help;
+	parseFuncs_["/QUIT"] = &Server::Leave;
+	parseFuncs_["/LEAVE"] = &Server::Leave;
+	parseFuncs_["/CHANNEL"] = &Server::ChangeChannel;
+	parseFuncs_["/PRIVATE"] = &Server::SendPrivateMessage;
+
 	memcpy(port_, port, strlen(port));
 
 	struct addrinfo hints, *p, *res;
@@ -198,25 +179,62 @@ int Server::Ping(User& nextUser)
 	return EXIT_SUCCESS;
 }
 
-int Server::DeleteUserbyid(int id)
+std::forward_list<Server::User>::const_iterator Server::FindUserbyid(const int id) const // constexpr
 {
-	auto deleteUserIter = std::find_if(connected_.cbegin(), connected_.cend(), [id](const User& user){
+	auto UserIter = std::find_if(connected_.cbegin(), connected_.cend(), [id](const User& user){
 		return user.sockfd_ == id;
 	});
 
+	return UserIter;
+}
+
+std::forward_list<Server::User>::iterator Server::FindUserbyid(const int id) // constexpr
+{
+	auto UserIter = std::find_if(connected_.begin(), connected_.end(), [id](const User& user){
+		return user.sockfd_ == id;
+	});
+
+	return UserIter;
+}
+
+std::forward_list<Server::User>::const_iterator Server::FindUserbyname(const std::string& name) const
+{
+	auto UserIter = std::find_if(connected_.cbegin(), connected_.cend(), [&name](const User& user){
+		return user.pseudo_ == name;
+	});
+
+	return UserIter;
+}
+
+std::forward_list<Server::User>::iterator Server::FindUserbyname(const std::string& name)
+{
+	auto UserIter = std::find_if(connected_.begin(), connected_.end(), [&name](const User& user){
+		return user.pseudo_ == name;
+	});
+
+	return UserIter;
+}
+
+std::string Server::DeleteUserbyid(int id)
+{
+	auto deleteUserIter = FindUserbyid(id);
 
 	if (deleteUserIter == connected_.cend())
 	{
-		SetServerReport("DeleteUserbyid logical error. Removing no exists id");
-		return EXIT_FAILURE;
+		SetServerReport("DeleteUserbyid logic error. Removing no exists id");
+		return "";
+		// crack processing
 	}
 	
+	close((*deleteUserIter).sockfd_);
+	std::string delete_user_nickname = (*deleteUserIter).pseudo_;
+	// connected_.remove(*deleteUserIter);
 	connected_.remove(*deleteUserIter);
 
 	errno = 0;
 
 	// Fork();
-	return EXIT_SUCCESS;
+	return delete_user_nickname;
 
 }
 
@@ -236,79 +254,107 @@ int Server::FillFD_set(fd_set* master) const
 }
 
 
-int Server::SendAll(const char* msg, size_t size, std::ostream* out) // const possible exception : if user is disconnected
+int Server::SendAll(const char* msg, size_t size, int except_id) // const possible exception : if user is disconnected
 {
-	*out << msg << "\n"; // BUILD message
 
-	pid_t pid = fork();
-	if (pid < 0)
+	const auto& this_user = FindUserbyid(except_id);
+
+	// size_t builtMsg_size = (*this_user).pseudo_.length() + ch_traits::length(msg) + 1;
+	std::string builtMsg = (*this_user).pseudo_ + ": " + msg
+
+	for(const auto& user : connected_)
 	{
-		SetServerReport("fork error. No possible create new process");
-		return EXIT_FAILURE;
-
-	} else if (pid == 0) // child 
-	{ 
-		int return_code = EXIT_SUCCESS;
-
-		fd_set master;
-		int FD_MAX = FillFD_set(&master);
-
-		struct timeval timeoff; // std timeoff 
-		timeoff.tv_sec = 1;
-		timeoff.tv_usec = 0;
-
-		int return_val_select; 
-		if ((return_val_select = select(FD_MAX + 1, NULL, &master, NULL, &timeoff)) < 0)
-			exit(EXIT_FAILURE);
-		else if (return_val_select == 0) // no available writing
-			exit(EXIT_SUCCESS);
-
-		std::forward_list<std::thread> executing_thread; 
-		for (int desc = 0; desc < FD_MAX + 1; ++desc)
+		if (user.sockfd_ != except_id && this_user.channel_ == user.channel_)
 		{
-			if (FD_ISSET(desc, &master))
+			if (send(user.sockfd_, builtMsg, builtMsg.length(), MSG_NOSIGNAL) < 0)
 			{
-				if (send(desc, msg, size, 0) <= 0)
-				{
-					std::thread delete_user_thread = std::thread(&Server::DeleteUserbyid, 
-						this, desc);
-					executing_thread.push_front(std::move(delete_user_thread));
-				}
+				queue_for_deleting.push_back(user.sockfd_);
 			}
 		}
-
-		for(auto& thread : executing_thread) // const or not?
-		{
-			if (thread.joinable())
-				thread.join(); // either join method is not-const or detach
-			else 
-			{
-				std::cerr << "WARNING : DETACH PRIORITY JOINABLE THREAD. UB\n";
-				SetServerReport("Server::DeleteUserbyid thread DETACHED. DEFAULT JOINED");
-				thread.detach();
-			}
-		}
-
-		exit(return_code);
-	} else { // parent
-		int stat;
-		wait(&stat);
-
-		if (WIFEXITED(stat))
-			// printf("%d", WEXITSTATUS(stat));
-			return EXIT_SUCCESS;
-		else
-			return EXIT_FAILURE;
 	}
 
 	return EXIT_SUCCESS;
 }
 
+int Server::AcceptNewConnection()
+{
+	struct sockaddr_storage cli_addr;
+	socklen_t cli_addrlen ;
+	int newsockfd;
+	ull bytes_recv = 0;
+	if (cliNo_ < 5)
+	{
+		// newsockfd = accept4(listener_, (struct sockaddr*)&cli_addr,
+			// &cli_addrlen, SOCK_NONBLOCK);
 
+		newsockfd = accept(listener_, (struct sockaddr*)&cli_addr,
+			&cli_addrlen);
+
+		if (newsockfd < 0)
+		{
+			if (newsockfd != EWOULDBLOCK) // accept is NONBLOCK and no connection is the queue;
+			{
+				std::string str = "Accept error. ";
+				str.append(strerror(errno)); 
+				SetServerReport(str.c_str());	
+				return -1;
+			}
+			
+			return -1;
+		}
+
+		char pseudo[64];
+		bytes_recv = recv(newsockfd, pseudo, 64, 0); // should wait the name
+
+		if (bytes_recv > 0)
+		{
+			pseudo[bytes_recv] = 0;
+			AddUser(newsockfd, std::move(cli_addr),
+				cli_addrlen, pseudo);
+			++cliNo_;
+
+		} else {
+			SetServerReport("New connection is not valid");
+			close(newsockfd);
+			return -1;
+		}
+	} else 
+	{
+		return -1;
+	}
+
+	return newsockfd;
+}
+
+
+void Server::Wait()
+{
+	std::string admin_command;
+	while (is_running_)
+	{
+		std::getline(std::cin, admin_command);
+
+		if (admin_command == "/STOP" || admin_command == "/QUIT")
+			is_running_ = false;
+
+		else if (admin_command == "/WHO")
+		{
+			for (const auto& user : connected_)
+			{
+				std::cout << user.pseudo_ << '\n';
+			}
+		}
+
+		std::cout.flush();
+	}
+}
 
 int Server::StartUp()
 {
 	is_running_ = true;
+
+	std::thread server_admin = std::thread(&Server::Wait, this);
+
 	char buffer[BUFFER_SIZE];    
 	fd_set master, cp_master; // master file descriptor list
 	int FD_MAX; // maximum file descriptor number
@@ -325,9 +371,10 @@ int Server::StartUp()
 
 	ull bytes_recv;
 
-	std::ofstream* notation  = new std::ofstream("notation.txt", std::ios_base::out | std::ios_base::trunc);
+	std::ofstream* notation  = new std::ofstream("notation.txt", std::ios::out | std::ios::trunc);
 	if (!notation->is_open())
 	{
+		std::cerr << "The notation is not saved. Error open file\n";
 		SetServerReport("The notation is not saved. Error open file");
 		delete notation;
 		notation = nullptr;
@@ -336,6 +383,7 @@ int Server::StartUp()
 	struct timeval timeoff = {.tv_sec = 3, .tv_usec = 0}; 
 	while(is_running_)
 	{
+
 		cp_master = master; 
 		// wait until at least one desc is ready
 		
@@ -344,67 +392,125 @@ int Server::StartUp()
 			return EXIT_FAILURE;
 		}
 
+		int newsockfd = 0; 
 		for (int i = 0; i < FD_MAX + 1; ++i)
 		{
 			if (FD_ISSET(i, &cp_master))
 			{
 				if (i == listener_)
 				{
-					struct sockaddr_storage cli_addr;
-					socklen_t cli_addrlen ;
-					// if (cliNo < 5)
-					int newsockfd = accept(listener_, (struct sockaddr*)&cli_addr,
-						&cli_addrlen);
-
-					char pseudo[64];
-					bytes_recv = recv(newsockfd, pseudo, 64, 0); // name
-
-					if (bytes_recv > 0)
+					newsockfd = AcceptNewConnection(); // non-block is set
+					if (newsockfd > 0)
 					{
-						AddUser(newsockfd, std::move(cli_addr),
-							cli_addrlen, pseudo);
-
+						SocketWrapperUtils::set_nonblock(newsockfd); // should we need it?
 						FD_SET(newsockfd, &master);
-						SocketWrapperUtils::set_nonblock(newsockfd);
-
-						if (newsockfd > FD_MAX)
-							FD_MAX = newsockfd;	
-						// set_nonblock()
-
-					} else {
-						close(newsockfd);
 					}
-
 				} else {
 
 					// check connection 
-					bytes_recv = recv(i, buffer, BUFFER_SIZE, 0);
+					// std::this_thread.sleep_for(std::chrono::seconds(1));
+					bytes_recv = recv(i, buffer, BUFFER_SIZE, 0); // MSG_DONTWAIT | MSG_WAITALL); // flag conflict?
+					// check on integrity data
 
-					if (bytes_recv <= 0) // error or client shutdown connection
+					if (bytes_recv < 0)
 					{
-						DeleteUserbyid(i);
-						FD_CLR(i, &master);
-						strncpy(buffer, "One of us left!", BUFFER_SIZE);
-						bytes_recv = strlen("One of us left!");
-					} else {
-						std::for_each(std::begin(buffer), std::begin(buffer) + bytes_recv, putchar);
-						std::cout.flush();
-					}
-
-
-					if (SendAll(buffer, bytes_recv, notation) == EXIT_FAILURE)
+						auto& problematic_user = *FindUserbyid(i);
+						std::cerr << "Error recv data[ " << buffer << " ] to " <<
+							"[ " << problematic_user.pseudo_ << " ] " << reinterpret_cast<char*>(
+								SocketWrapperUtils::get_in_addr(reinterpret_cast<struct sockaddr*>(
+									&problematic_user.user_addr_)));
+						perror("");
+						//proseccing error
+					} else if (bytes_recv == 0) // error or client shutdown connection
+						queue_for_deleting.push(i);
+					else // when user disconnected buffer is empty 
 					{
-						return EXIT_FAILURE;
+						buffer[bytes_recv] = 0;
+						std::cout << "__"<< buffer << "__" << std::endl;
+						ParseMessage(buffer, bytes_recv, i);	
 					}
-
 				}
 			}
+		}
 
+		if (newsockfd > FD_MAX)
+			FD_MAX = newsockfd;
+
+
+		ClearQueueforDelete(&master, Server::deletePolicy::CHECKCON);
+	}
+
+	server_admin.detach();
+	notation->close();
+	delete notation;
+
+	return EXIT_SUCCESS;
+}
+
+
+int Server::ParseMessage(const std::string& raw_msg, size_t size_msg, const int id) 
+{
+	if (raw_msg[0] == '/') // command
+	{
+		std::string commands;
+		std::string params;
+
+		size_t idx = raw_msg.find(' ');
+		if (idx == std::string::npos)
+		{
+			commands = raw_msg;
+			params = "";
+		} else {
+			commands = raw_msg.substr(0, idx);
+			params = raw_msg.substr(idx + 1);
+		}
+			
+		try 
+		{
+			int return_code = (this->*parseFuncs_.at(commands))(id, params);
+		} catch (...)
+		{
+		 	commands += ": command not found. Use /HELP command for available ones!";
+			if (send(id, commands.c_str(), commands.length(), MSG_NOSIGNAL) < 0) //when connection is aborted by
+			{
+				queue_for_deleting.push(id);
+			}
+		}	
+	} else 
+	
+	{
+		if (SendAll(raw_msg.c_str(), size_msg, id) == EXIT_FAILURE)
+		{
+			return EXIT_FAILURE;
 		}
 	}
 
-	notation->close();
-	delete notation;
+	return EXIT_SUCCESS;
+}
+
+int Server::ClearQueueforDelete(fd_set* master, Server::deletePolicy pPolicy)
+{
+	// id can be dublicate
+	std::string leave_users_name;
+	while (!queue_for_deleting.empty())
+	{
+		int id = queue_for_deleting.front();
+		queue_for_deleting.pop();
+
+		if (pPolicy == Server::deletePolicy::CHECKCON)
+		{
+			std::this_thread::sleep_for(std::chrono::seconds{1});
+			char buf[2];
+			if (recv(id, buf, 2, 0) != 0)
+				continue;
+		}
+
+		leave_users_name += DeleteUserbyid(id);
+		leave_users_name.push_back('\n');
+		FD_CLR(id, master);
+
+		
+	}
 
 	return EXIT_SUCCESS;
 }
@@ -413,7 +519,7 @@ int Server::StartUp()
 Server::~Server()
 {	
 
-	for (const auto& user : connected_)
+	for (auto& user : connected_)
 	{
 		close(user.sockfd_);
 	}
@@ -440,4 +546,4 @@ const char* Server::GetServerReport() const
 	return info_.c_str();
 }
 
-
+#include "commands.cpp"

@@ -1,0 +1,5 @@
+/HELP - invoke the note
+/WHO - send request to the server about connection users, if success user recvs their pseudo
+/QUIT /LEAVE - abort connection with the server
+/CHANNEL [NUM] - change channel (DEFAULT 0) to the number NUM
+/PRIVATE [WHO] [WHAT] - send private message[WHAT] to specific user [WHO]
