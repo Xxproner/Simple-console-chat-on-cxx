@@ -10,21 +10,28 @@
 #include <vector>
 #include <forward_list>
 #include <thread>
+#include <chrono>
 
-#define MAX_QUEUE_SIZE 5
+#ifndef
+	#define DELAY_F_CONN(x) std::this_thread::sleep_for(std::chrono::seconds{(x)});
+#endif
 
 class Server
 {
 private:
+	constexpr static size_t MAX_QUEUE_SIZE = 5;
 	typedef int (Server::*Function) (const int, const std::string& );
 	typedef std::map<std::string, Function> mapFunctions;
 	mapFunctions parseFuncs_;
+
+	// mutable std::map<int, std::mutex> mMutexAll_;
 
 	class SocketWrapperUtils
 	{
 	public:
 		static int set_nonblock(int socket);
 		static void* get_in_addr(struct sockaddr* sa);
+		static int set_block(int socket);
 	};
 
 	struct User
@@ -48,9 +55,7 @@ private:
 	bool is_running_;
 	sockaddr_in serv_addr_;
 	char port_[6];
-	int listener_;
-
-	
+	int listener_; // for chatting only
 
 	enum class deletePolicy
 	{
@@ -63,14 +68,6 @@ private:
 	int ClearQueueforDelete(fd_set* master, Server::deletePolicy pPolicy);
 
 	std::string info_;
-
-public:
-
-	Server();
-
-	int Setup(const char* port);
-
-	int StartUp();
 
 	template <typename... Args>
 	int AddUser(Args ...args);
@@ -109,12 +106,33 @@ public:
 
 	void PossibleCommandsInfo(std::ostream& out = std::cout) const;
 
+	int EstablishNewConnection(const std::string& cmdFILE_file_name,
+		FILE_STATUS STATUS) const;
+
+	int FileRecv(std::string file_name,
+		int sock, const struct sockaddr* addr, socklen_t addr_size) const;
+
+	int FileSend(std::string file_name, int sock,
+		const struct sockaddr* addr, socklen_t addr_size) const;
+
+public:
+
+	Server();
+
+	int Setup(const char* port);
+
+	int StartUp();
+
+	
+	
 	~Server();
 };
 
 template <typename... Args>
 int Server::AddUser(Args ...args)
 {
+	mMutexAll_.insert(id, std::mutex{});
+	
 	connected_.emplace_front(args...);
 	Ping(connected_.front());
 

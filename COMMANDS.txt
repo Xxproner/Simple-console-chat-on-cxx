@@ -3,3 +3,5 @@
 /QUIT /LEAVE - abort connection with the server
 /CHANNEL [NUM] - change channel (DEFAULT 0) to the number NUM
 /PRIVATE [WHO] [WHAT] - send private message[WHAT] to specific user [WHO]
+/FILE [FILE NAME] - download [FILE NAME] file to the server, chat participant can load it. With command /FILE_LOAD
+/FILE_LOAD [FILE NAME] - download [FILE NAME] file from the server

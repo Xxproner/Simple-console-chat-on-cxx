@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 
+
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -18,6 +19,8 @@
 #include <algorithm>
 #include <thread>
 #include <forward_list>
+#include <type_traits>
+
 
 #include "Server.hh"
 
@@ -48,6 +51,17 @@ int Server::SocketWrapperUtils::set_nonblock(int socket)
 	return EXIT_SUCCESS;
 }
 
+int Server::SocketWrapperUtils::set_block(int socket)
+{
+	int flags;
+	flags = fcntl(socket, F_GETFL, 0);
+	if (flags == -1)
+		return EXIT_FAILURE;
+	if (fcntl(socket, F_SETFL, flags ^ O_NONBLOCK) == -1)
+		return EXIT_FAILURE;
+	return EXIT_SUCCESS;
+}
+
 
 void mnet_error::perror(const char* note);
 
@@ -74,12 +88,20 @@ Server::Server() : cliNo_(0), listener_(-1)
 
 int Server::Setup(const char* port)
 {
+	struct stat sb;
+	if (stat("files", &sb) != 0)
+	{
+		std::system("mkdir files");
+	}
+
 	parseFuncs_["/WHO"] = &Server::WhoRequest;
 	parseFuncs_["/HELP"] = &Server::Help;
 	parseFuncs_["/QUIT"] = &Server::Leave;
 	parseFuncs_["/LEAVE"] = &Server::Leave;
 	parseFuncs_["/CHANNEL"] = &Server::ChangeChannel;
 	parseFuncs_["/PRIVATE"] = &Server::SendPrivateMessage;
+	parseFuncs_["/FILE"] = &Server::FileRecv
+	parseFuncs_["/FILE_LOAD"] = &Server::FileSend
 
 	memcpy(port_, port, strlen(port));
 
@@ -226,14 +248,15 @@ std::string Server::DeleteUserbyid(int id)
 		// crack processing
 	}
 	
+
 	close((*deleteUserIter).sockfd_);
 	std::string delete_user_nickname = (*deleteUserIter).pseudo_;
 	// connected_.remove(*deleteUserIter);
 	connected_.remove(*deleteUserIter);
 
-	errno = 0;
+	mMutexAll_.erase(id);
 
-	// Fork();
+	errno = 0;
 	return delete_user_nickname;
 
 }
@@ -256,7 +279,6 @@ int Server::FillFD_set(fd_set* master) const
 
 int Server::SendAll(const char* msg, size_t size, int except_id) // const possible exception : if user is disconnected
 {
-
 	const auto& this_user = FindUserbyid(except_id);
 
 	// size_t builtMsg_size = (*this_user).pseudo_.length() + ch_traits::length(msg) + 1;
@@ -351,6 +373,8 @@ void Server::Wait()
 
 int Server::StartUp()
 {
+	std::system("rm -rf materials/*");
+
 	is_running_ = true;
 
 	std::thread server_admin = std::thread(&Server::Wait, this);
@@ -371,7 +395,8 @@ int Server::StartUp()
 
 	ull bytes_recv;
 
-	std::ofstream* notation  = new std::ofstream("notation.txt", std::ios::out | std::ios::trunc);
+	std::ofstream* notation  = new std::ofstream;
+	notation.open("notation.txt", std::ios::out | std::ios::trunc);
 	if (!notation->is_open())
 	{
 		std::cerr << "The notation is not saved. Error open file\n";
@@ -383,7 +408,6 @@ int Server::StartUp()
 	struct timeval timeoff = {.tv_sec = 3, .tv_usec = 0}; 
 	while(is_running_)
 	{
-
 		cp_master = master; 
 		// wait until at least one desc is ready
 		
@@ -402,14 +426,14 @@ int Server::StartUp()
 					newsockfd = AcceptNewConnection(); // non-block is set
 					if (newsockfd > 0)
 					{
-						SocketWrapperUtils::set_nonblock(newsockfd); // should we need it?
+						// SocketWrapperUtils::set_nonblock(newsockfd); // should we need it?
 						FD_SET(newsockfd, &master);
 					}
 				} else {
 
 					// check connection 
 					// std::this_thread.sleep_for(std::chrono::seconds(1));
-					bytes_recv = recv(i, buffer, BUFFER_SIZE, 0); // MSG_DONTWAIT | MSG_WAITALL); // flag conflict?
+					bytes_recv = recv(i, buffer, BUFFER_SIZE, MSG_DONTWAIT); // MSG_DONTWAIT | MSG_WAITALL); // flag conflict?
 					// check on integrity data
 
 					if (bytes_recv < 0)
@@ -435,7 +459,6 @@ int Server::StartUp()
 
 		if (newsockfd > FD_MAX)
 			FD_MAX = newsockfd;
-
 
 		ClearQueueforDelete(&master, Server::deletePolicy::CHECKCON);
 	}
@@ -545,5 +568,8 @@ const char* Server::GetServerReport() const
 {
 	return info_.c_str();
 }
+
+
+
 
 #include "commands.cpp"
